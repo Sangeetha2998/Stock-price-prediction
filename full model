@@ -1,97 +1,129 @@
 import yfinance as yf
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential
-from keras.layers import LSTM, Dense
+from keras.layers import LSTM, GRU, Dense, Dropout
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
 
+# Step 1: Data Acquisition
+ticker = 'ITC.NS'  # Example stock ticker
+data = yf.download(ticker, start='2019-01-01', end='2024-12-02', interval='1d')  # Daily data for 1 year
 
-symbol = input("Enter the stock symbol: ")
-stock_data = yf.download(symbol, period='5y')
+# Step 2: Data Preprocessing
+data['Close'] = data['Close'].astype(float)
 
-if stock_data.empty:
-    print(f"Error: Could not retrieve data for symbol '{symbol}'. Please check the symbol and try again.")
-else:
-    stock_data['SMA'] = stock_data['Close'].rolling(window=20).mean()
-    stock_data['SD'] = stock_data['Close'].rolling(window=20).std()
-    stock_data['UB'] = stock_data['SMA'] + 2 * stock_data['SD']
-    stock_data['LB'] = stock_data['SMA'] - 2 * stock_data['SD']
+# Feature Engineering: Adding technical indicators
+data['SMA'] = data['Close'].rolling(window=20).mean()  # Simple Moving Average
+data['EMA'] = data['Close'].ewm(span=20, adjust=False).mean()  # Exponential Moving Average
+data['Volume'] = data['Volume'].astype(float)  # Ensure Volume is float
 
-    stock_data['Above UB'] = stock_data['Close'] > stock_data['UB']
-    stock_data['Below LB'] = stock_data['Close'] < stock_data['LB']
+# Drop rows with NaN values
+data.dropna(inplace=True)
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax1.plot(stock_data.index, stock_data['Close'], label='Close Price', color='blue')
-    ax1.plot(stock_data.index, stock_data['SMA'], label='SMA', color='orange')
-    ax1.plot(stock_data.index, stock_data['UB'], label='Upper Bollinger Band', color='red')
-    ax1.plot(stock_data.index, stock_data['LB'], label='Lower Bollinger Band', color='green')
+# Use only relevant features
+data = data[['Close', 'SMA', 'EMA', 'Volume']]
 
+# Normalize the data
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(data)
 
-    ax1.scatter(stock_data.index[stock_data['Above UB']], stock_data['Close'][stock_data['Above UB']],
-                marker='^', color='red', s=100, label='Above Upper Band')
-    ax1.scatter(stock_data.index[stock_data['Below LB']], stock_data['Close'][stock_data['Below LB']],
-                marker='v', color='green', s=100, label='Below Lower Band')
+# Create sequences for LSTM and GRU
+def create_sequences(data, time_steps=1):
+    x, y = [], []
+    for i in range(len(data) - time_steps):
+        x.append(data[i:(i + time_steps), :])  # Use all features
+        y.append(data[i + time_steps, 0])  # Predicting the 'Close' price
+    return np.array(x), np.array(y)
 
-    # Setting y-axis labels
-    ax1.set_yticks(np.arange(0, stock_data['Close'].max() if not np.isnan(stock_data['Close'].max()) else 1, 50)) # Set a default max value if stock_data['Close'].max() is nan.
-    ax1.set_ylabel('Price')
+time_steps = 60  # Using the last 60 days for prediction
+x, y = create_sequences(scaled_data, time_steps)
+x = np.reshape(x, (x.shape[0], x.shape[1], x.shape[2]))
 
-    ax1.legend(loc='best')
+from keras.layers import Input
 
-    ax2 = ax1.twinx()
-    ax2.fill_between(stock_data.index, stock_data['Volume'], color='black', alpha=0.3)
-    ax2.set_ylabel('Volume', color='gray')
-    ax2.tick_params(axis='y', labelcolor='gray')
-    plt.title(f'Bollinger Bands for {symbol}')
-    plt.show()
+# Step 3: Model Building
+model = Sequential()
 
+# Adding Input layer and LSTM layers
+model.add(Input(shape=(x.shape[1], x.shape[2])))  # Use Input layer
+model.add(LSTM(units=100, return_sequences=True))
+model.add(Dropout(0.2))
 
+model.add(LSTM(units=100, return_sequences=True))
+model.add(Dropout(0.2))
 
-    scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(stock_data['Close'].values.reshape(-1, 1))
+# Adding GRU layers
+model.add(GRU(units=50, return_sequences=True))
+model.add(Dropout(0.2))
 
-    # Split data into training and testing sets
-    train_size = int(len(scaled_data) * 0.8)
-    train_data, test_data = scaled_data[0:train_size], scaled_data[train_size:]
+model.add(GRU(units=50))
+model.add(Dropout(0.2))
 
-    # Create LSTM model
-    model = Sequential()
-    model.add(LSTM(50, input_shape=(1, 1)))
-    model.add(Dense(1))
-    model.compile(loss='mean_squared_error', optimizer='adam')
+# Output layer
+model.add(Dense(units=1))  # Predicting the next closing price
+model.compile(optimizer='adam', loss='mean_squared_error')
 
-    # Reshape data for LSTM
-    X_train = []
-    y_train = []
-    for i in range(20, len(train_data)):
-        X_train.append(train_data[i-20:i, 0])
-        y_train.append(train_data[i, 0])
-    X_train, y_train = np.array(X_train), np.array(y_train)
-    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+# Step 4: Model Training with Callbacks
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001)
 
-    # Train model
-    model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=2)
+# Fit the model
+model.fit(x, y, epochs=100, batch_size=32, verbose=1,
+          validation_split=0.2, callbacks=[early_stopping, reduce_lr])
 
-    # Make predictions
-    X_test = []
-    for i in range(20, len(test_data)):
-        X_test.append(test_data[i-20:i, 0])
-    X_test = np.array(X_test)
-    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
-    predictions = model.predict(X_test)
+# Step 5: Prediction
+# Prepare last 60 days for prediction
+last_prices = scaled_data[-time_steps:]
+last_prices = last_prices.reshape(1, -1, last_prices.shape[1])
 
-    # Predict next day's closing price
-    last_20_days = scaled_data[-20:]
-    last_20_days = np.reshape(last_20_days, (1, 20, 1))
-    next_day_prediction = model.predict(last_20_days)
-    next_day_prediction = scaler.inverse_transform(next_day_prediction)
+predicted_prices = []
+for _ in range(10):  # Predicting for the next 10 days
+    predicted_price_scaled = model.predict(last_prices)
 
-    print(f"Predicted closing price for next day: {next_day_prediction[0][0]:.2f}")
+    # Create a temporary array to hold the predicted price and the other features
+    temp_array = np.zeros((1, 1, last_prices.shape[2]))
+    temp_array[0, 0, 0] = predicted_price_scaled[0, 0]  # Close price
+    temp_array[0, 0, 1:] = last_prices[0, -1, 1:]  # Other features
 
-    # Plot predicted closing price for September 9th, 2024
-    plt.plot(['Next Day'], [next_day_prediction[0][0]], marker='o')
-    plt.xlabel('Date')
-    plt.ylabel('Closing Price')
-    plt.title('Predicted Closing Price for next day')
-    plt.show()
+    # Update last_prices for the next prediction
+    last_prices = np.append(last_prices[:, 1:, :], temp_array, axis=1)
+
+    # Inverse transform to get the actual price
+    predicted_price = scaler.inverse_transform(temp_array[0])  # Get the actual price
+    predicted_prices.append(predicted_price[0][0])  # Store the 'Close' price
+
+# Print predicted prices for the next 10 days
+print("Predicted prices for the next 10 days:", predicted_prices)
+
+# Step 6: Model Evaluation
+# Prepare the test set
+x_eval, y_eval = create_sequences(scaled_data[-(len(data) - time_steps):], time_steps)
+x_eval = np.reshape(x_eval, (x_eval.shape[0], x_eval.shape[1], x_eval.shape[2]))
+
+# Predictions on the evaluation set
+y_pred = model.predict(x_eval)
+# Step 6: Model Evaluation (continued)
+y_pred_inverse = scaler.inverse_transform(np.concatenate((y_pred, x_eval[:, -1, 1:].reshape(-1, x_eval.shape[2] - 1)), axis=1))
+
+# Calculate evaluation metrics
+mse = mean_squared_error(y_eval, y_pred_inverse[:, 0])
+mae = mean_absolute_error(y_eval, y_pred_inverse[:, 0])
+
+print("Mean Squared Error (MSE):", mse)
+print("Mean Absolute Error (MAE):", mae)
+
+# Optional: Plotting the results for visual inspection
+import matplotlib.pyplot as plt
+
+# Plotting the actual vs predicted prices
+plt.figure(figsize=(14, 7))
+plt.plot(data.index[-len(y_eval):], data['Close'].values[-len(y_eval):], label='Actual Prices', color='blue')
+plt.plot(data.index[-len(y_eval):], y_pred_inverse[:, 0], label='Predicted Prices', color='orange')
+plt.title('Actual vs Predicted Prices')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.show()
